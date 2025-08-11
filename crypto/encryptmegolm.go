@@ -344,6 +344,178 @@ func (mach *OlmMachine) ShareGroupSession(ctx context.Context, roomID id.RoomID,
 	return mach.CryptoStore.AddOutboundGroupSession(ctx, session)
 }
 
+func (mach *OlmMachine) ShareGroupSessionAll(ctx context.Context, roomID id.RoomID, users []id.UserID, allowUnverifiedDevices bool) error {
+	mach.megolmEncryptLock.Lock()
+	defer mach.megolmEncryptLock.Unlock()
+
+	session, err := mach.CryptoStore.GetOutboundGroupSession(ctx, roomID)
+	if err != nil {
+		return fmt.Errorf("failed to get previous outbound group session: %w", err)
+	} else if session != nil && session.Shared && !session.Expired() {
+		mach.machOrContextLog(ctx).Debug().Stringer("room_id", roomID).Msg("Not re-sharing group session, already shared")
+		return nil
+	}
+
+	log := mach.machOrContextLog(ctx).With().
+		Str("room_id", roomID.String()).
+		Str("action", "share megolm session").
+		Logger()
+	ctx = log.WithContext(ctx)
+
+	if session == nil || session.Expired() {
+		if session, err = mach.newOutboundGroupSession(ctx, roomID); err != nil {
+			return err
+		}
+	}
+
+	log = log.With().Str("session_id", session.ID().String()).Logger()
+	ctx = log.WithContext(ctx)
+
+	log.Debug().Array("users", exzerolog.ArrayOfStrs(users)).Msg("Sharing group session for room")
+
+	withheldCount := 0
+	toDeviceWithheld := &mautrix.ReqSendToDevice{Messages: make(map[id.UserID]map[id.DeviceID]*event.Content)}
+	olmSessions := make(map[id.UserID]map[id.DeviceID]deviceSessionWrapper)
+	missingSessions := make(map[id.UserID]map[id.DeviceID]*id.Device)
+	missingUserSessions := make(map[id.DeviceID]*id.Device)
+	var fetchKeysForUsers []id.UserID
+	for _, userID := range users {
+		log := log.With().Str("target_user_id", userID.String()).Logger()
+
+		devices, err := mach.CryptoStore.GetDevices(ctx, userID)
+		if err != nil {
+			log.Err(err).Msg("Failed to get devices of user")
+			return fmt.Errorf("failed to get devices of user %s: %w", userID, err)
+		}
+
+		if devices == nil {
+			log.Debug().Msg("GetDevices returned nil, will fetch keys and retry")
+			fetchKeysForUsers = append(fetchKeysForUsers, userID)
+			continue
+		}
+
+		// 过滤设备：只保留已验证或允许未验证设备
+		var filteredDevices []*id.Device
+		for _, device := range devices {
+			if allowUnverifiedDevices || device.Trust == id.TrustStateVerified {
+				filteredDevices = append(filteredDevices, device)
+			}
+		}
+
+		// 把切片转成 map[id.DeviceID]*id.Device
+		filteredDevicesMap := make(map[id.DeviceID]*id.Device, len(filteredDevices))
+		for _, device := range filteredDevices {
+			filteredDevicesMap[device.DeviceID] = device
+		}
+
+		if len(filteredDevices) == 0 {
+			log.Trace().Msg("No allowed devices after filtering, skipping user")
+			continue
+		}
+
+		log.Trace().Msg("Trying to find olm session to encrypt megolm session for user")
+		toDeviceWithheld.Messages[userID] = make(map[id.DeviceID]*event.Content)
+		olmSessions[userID] = make(map[id.DeviceID]deviceSessionWrapper)
+
+		mach.findOlmSessionsForUserAll(ctx, session, userID, filteredDevicesMap, olmSessions[userID], toDeviceWithheld.Messages[userID], missingUserSessions, allowUnverifiedDevices)
+
+		log.Debug().
+			Int("olm_session_count", len(olmSessions[userID])).
+			Int("withheld_count", len(toDeviceWithheld.Messages[userID])).
+			Int("missing_count", len(missingUserSessions)).
+			Msg("Completed first pass of finding olm sessions")
+
+		withheldCount += len(toDeviceWithheld.Messages[userID])
+		if len(missingUserSessions) > 0 {
+			missingSessions[userID] = missingUserSessions
+			missingUserSessions = make(map[id.DeviceID]*id.Device)
+		}
+
+		if len(toDeviceWithheld.Messages[userID]) == 0 {
+			delete(toDeviceWithheld.Messages, userID)
+		}
+	}
+
+	if len(fetchKeysForUsers) > 0 {
+		log.Debug().Array("users", exzerolog.ArrayOfStrs(fetchKeysForUsers)).Msg("Fetching missing keys")
+		keys, err := mach.FetchKeys(ctx, fetchKeysForUsers, true)
+		if err != nil {
+			log.Err(err).Array("users", exzerolog.ArrayOfStrs(fetchKeysForUsers)).Msg("Failed to fetch missing keys")
+			return fmt.Errorf("failed to fetch missing keys: %w", err)
+		}
+		for userID, devices := range keys {
+			log.Debug().
+				Int("device_count", len(devices)).
+				Str("target_user_id", userID.String()).
+				Msg("Got device keys for user")
+			missingSessions[userID] = devices
+		}
+	}
+
+	if len(missingSessions) > 0 {
+		log.Debug().Msg("Creating missing olm sessions")
+		err = mach.createOutboundSessions(ctx, missingSessions)
+		if err != nil {
+			log.Err(err).Msg("Failed to create missing olm sessions")
+			return fmt.Errorf("failed to create missing olm sessions: %w", err)
+		}
+	}
+	for userID, devices := range missingSessions {
+		if len(devices) == 0 {
+			continue
+		}
+		output, ok := olmSessions[userID]
+		if !ok {
+			output = make(map[id.DeviceID]deviceSessionWrapper)
+			olmSessions[userID] = output
+		}
+		withheld, ok := toDeviceWithheld.Messages[userID]
+		if !ok {
+			withheld = make(map[id.DeviceID]*event.Content)
+			toDeviceWithheld.Messages[userID] = withheld
+		}
+
+		log := log.With().Str("target_user_id", userID.String()).Logger()
+		log.Trace().Msg("Trying to find olm session to encrypt megolm session for user (post-fetch retry)")
+		mach.findOlmSessionsForUser(ctx, session, userID, devices, output, withheld, nil)
+
+		log.Debug().
+			Int("olm_session_count", len(output)).
+			Int("withheld_count", len(withheld)).
+			Msg("Completed post-fetch retry of finding olm sessions")
+
+		withheldCount += len(toDeviceWithheld.Messages[userID])
+		if len(toDeviceWithheld.Messages[userID]) == 0 {
+			delete(toDeviceWithheld.Messages, userID)
+		}
+	}
+
+	err = mach.encryptAndSendGroupSession(ctx, session, olmSessions)
+	if err != nil {
+		return fmt.Errorf("failed to share group session: %w", err)
+	}
+
+	if len(toDeviceWithheld.Messages) > 0 {
+		log.Debug().
+			Int("device_count", withheldCount).
+			Int("user_count", len(toDeviceWithheld.Messages)).
+			Msg("Sending to-device messages to report withheld key")
+
+		// TODO remove the next 4 lines once clients support m.room_key.withheld
+		_, err = mach.Client.SendToDevice(ctx, event.ToDeviceOrgMatrixRoomKeyWithheld, toDeviceWithheld)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to report withheld keys (legacy event type)")
+		}
+		_, err = mach.Client.SendToDevice(ctx, event.ToDeviceRoomKeyWithheld, toDeviceWithheld)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to report withheld keys")
+		}
+	}
+	log.Debug().Msg("Group session successfully shared")
+	session.Shared = true
+	return mach.CryptoStore.AddOutboundGroupSession(ctx, session)
+}
+
 func (mach *OlmMachine) encryptAndSendGroupSession(ctx context.Context, session *OutboundGroupSession, olmSessions map[id.UserID]map[id.DeviceID]deviceSessionWrapper) error {
 	mach.olmLock.Lock()
 	defer mach.olmLock.Unlock()
@@ -445,5 +617,83 @@ func (mach *OlmMachine) findOlmSessionsForUser(ctx context.Context, session *Out
 			}
 			session.Users[userKey] = OGSAlreadyShared
 		}
+	}
+}
+
+func (mach *OlmMachine) findOlmSessionsForUserAll(
+	ctx context.Context,
+	session *OutboundGroupSession,
+	userID id.UserID,
+	devices map[id.DeviceID]*id.Device,
+	output map[id.DeviceID]deviceSessionWrapper,
+	withheld map[id.DeviceID]*event.Content,
+	missingOutput map[id.DeviceID]*id.Device,
+	allowUnverifiedDevices bool,
+) {
+	for deviceID, device := range devices {
+		log := zerolog.Ctx(ctx).With().
+			Stringer("target_user_id", userID).
+			Stringer("target_device_id", deviceID).
+			Stringer("target_identity_key", device.IdentityKey).
+			Logger()
+
+		userKey := UserDevice{UserID: userID, DeviceID: deviceID}
+
+		if state := session.Users[userKey]; state != OGSNotShared {
+			continue
+		} else if userID == mach.Client.UserID && deviceID == mach.Client.DeviceID {
+			session.Users[userKey] = OGSIgnored
+			continue
+		} else if device.Trust == id.TrustStateBlacklisted {
+			log.Debug().Msg("Not encrypting group session for device: device is blacklisted")
+			withheld[deviceID] = &event.Content{Parsed: &event.RoomKeyWithheldEventContent{
+				RoomID:    session.RoomID,
+				Algorithm: id.AlgorithmMegolmV1,
+				SessionID: session.ID(),
+				SenderKey: mach.account.IdentityKey(),
+				Code:      event.RoomKeyWithheldBlacklisted,
+				Reason:    "Device is blacklisted",
+			}}
+			session.Users[userKey] = OGSIgnored
+			continue
+		}
+
+		trustState, _ := mach.ResolveTrustContext(ctx, device)
+		if !allowUnverifiedDevices && trustState < mach.SendKeysMinTrust {
+			log.Debug().
+				Str("min_trust", mach.SendKeysMinTrust.String()).
+				Str("device_trust", trustState.String()).
+				Msg("Not encrypting group session for device: device is not trusted")
+			withheld[deviceID] = &event.Content{Parsed: &event.RoomKeyWithheldEventContent{
+				RoomID:    session.RoomID,
+				Algorithm: id.AlgorithmMegolmV1,
+				SessionID: session.ID(),
+				SenderKey: mach.account.IdentityKey(),
+				Code:      event.RoomKeyWithheldUnverified,
+				Reason:    "This device does not encrypt messages for unverified devices",
+			}}
+			session.Users[userKey] = OGSIgnored
+			continue
+		}
+
+		deviceSession, err := mach.CryptoStore.GetLatestSession(ctx, device.IdentityKey)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get olm session to encrypt group session")
+			continue
+		}
+
+		if deviceSession == nil {
+			log.Warn().Msg("Didn't find olm session to encrypt group session")
+			if missingOutput != nil {
+				missingOutput[deviceID] = device
+			}
+			continue
+		}
+
+		output[deviceID] = deviceSessionWrapper{
+			session:  deviceSession,
+			identity: device,
+		}
+		session.Users[userKey] = OGSAlreadyShared
 	}
 }
